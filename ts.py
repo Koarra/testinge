@@ -1,251 +1,237 @@
-   try:
-        names = ", ".join(c["name"] for c in get_designated_countries())
-    except Exception:
-        # A broken/missing designated-countries source must not take down every
-        # tree's prompts: only sensitive_charities consumes this token, and its
-        # compute node fails safe (material Missing Information) on its own.
-        names = ""
-    return {"designated_countries_list": names}
+# Reference copy: ADDITIONS to main/riskflag_detection/utils.py (the module
+# already holding SIAPState, function_mapping, llm_prompter_full, etc.).
+#
+# Sensitive-charities designated-country check (policy criterion 4, limbs 1-3).
+# Category-specific logic kept out of the generic SIAPTree engine: register the
+# node here in function_mapping; the label is referenced solely by the
+# sensitive_charities tree. The LLM extracts countries and flow shares from the
+# client notes; all decisions (designation membership, the '25% or more'
+# threshold) are made in plain code against the current designated-country list.
 
+from typing import List, Optional
 
+from langchain.messages import HumanMessage
+from langchain_openai import AzureChatOpenAI
+from pydantic import BaseModel, Field
 
-
-from abc import ABC
-from typing import Callable
-
-from langgraph.graph import END, START, StateGraph
-
+from main.constants import AZURE_OPENAI_LLM_CONFIG
 from main.riskflag_detection.countries import get_designated_countries
-from main.riskflag_detection.scap_tree import SCAPGraph
-from main.riskflag_detection.utils import (
-    SIAPState,
-    get_scap2_flag,
-    llm_prompter,
-    llm_prompter_full,
-    output_format_mapping,
-    TextAnswer,
-    result_fetcher,
-)
 
-def extra_placeholders() -> dict:
-    """Placeholders beyond {activity} that tree prompts may reference (e.g. the
-    designated-country list injected into sensitive_charities' public-information
-    check). Built per call so list updates are picked up without a restart;
-    str.format ignores unused kwargs, so trees that don't use them are unaffected."""
+
+class CountryRef(BaseModel):
+    country: str = Field(
+        description="Country name, using the most recent ISO 3166 English name"
+    )
+    iso_alpha2: Optional[str] = Field(
+        default=None,
+        description="ISO 3166-1 alpha-2 code (2 letters, e.g. 'SY'); null if unsure",
+    )
+
+
+class CountryFlowShare(CountryRef):
+    share_pct: Optional[float] = Field(
+        default=None,
+        description="Share of the charity's total inflow/outflow value, as a "
+        "number from 0 to 100 (e.g. 40 for 40%), if stated in the notes; "
+        "null when no share is stated",
+    )
+
+
+class CharityCountryExtraction(BaseModel):
+    establishment_countries: List[CountryRef] = Field(
+        description="Countries where the charity/NPO is registered, headquartered "
+        "or constituted; empty if not determinable from the notes"
+    )
+    inflow_shares: List[CountryFlowShare] = Field(
+        description="Countries the charity receives funding from (donations, "
+        "grants, funding), with the % of total inflow value where stated"
+    )
+    outflow_shares: List[CountryFlowShare] = Field(
+        description="Countries the charity disburses funds to (projects, grants "
+        "made, programs), with the % of total outflow value where stated"
+    )
+    countries_determinable: bool = Field(
+        description="False when the notes do not allow determining the charity's "
+        "countries at all"
+    )
+
+
+CHARITY_COUNTRY_EXTRACTION_PROMPT = """\
+You are an expert compliance officer. Extract ONLY the geographic facts below from
+the client notes — do not judge whether any country is sensitive or designated.
+
+1. establishment_countries: where the charity/NPO is registered, headquartered or
+   constituted (its domicile / place of establishment).
+2. inflow_shares: each country the charity receives funding from (donations,
+   grants, funding), with the stated % of total inflow value; leave share_pct null
+   when no share is stated.
+3. outflow_shares: each country the charity disburses funds to (projects, grants
+   made, programs), with the stated % of total outflow value; leave share_pct null
+   when no share is stated.
+Express every share as a number from 0 to 100 (e.g. 40 for 40%), never as a
+fraction. Count indirect flows (funds routed via intermediaries) toward the
+ultimate origin or destination country where the notes make it clear. Use the
+most recent ISO 3166 English country names, and give each country's ISO 3166-1
+alpha-2 code (2 letters); leave the code null if unsure. Set
+countries_determinable to false when the notes do not allow determining the
+countries at all.
+
+Client notes:
+{client_notes}
+
+Activity under assessment:
+{activity}
+"""
+
+_MI_DETAILS = {
+    "designated_share_not_stated": (
+        "MATERIAL missing information: {countries} appears in the charity's fund "
+        "flows and is on the designated-country list, but the share of "
+        "inflow/outflow value linked to it is not stated — the 25% threshold "
+        "cannot be confirmed."
+    ),
+    "countries_not_determinable": (
+        "MATERIAL missing information: the charity's countries of establishment "
+        "and fund flows cannot be determined from the notes, so the "
+        "designated-country check cannot be assessed."
+    ),
+    "extraction_failed": (
+        "MATERIAL missing information: the country extraction failed, so the "
+        "designated-country check could not be assessed."
+    ),
+    "designated_list_unavailable": (
+        "MATERIAL missing information: the designated-country list could not be "
+        "loaded, so the designated-country check could not be assessed."
+    ),
+}
+
+
+def _finish_designated_country_check(
+    state, answer: str, reason: str, unknown_designated: List[str]
+):
+    # Reason and materiality first, answer last: result_fetcher routes on the
+    # LAST entry in node_outputs, so the final append must be the Yes/No/MI answer.
+    state["node_outputs"].append({"designated_country_check_reason": reason})
+    if answer == "Missing Information":
+        state["node_outputs"].append(
+            {"designated_country_check_materiality": "material"}
+        )
+        detail = _MI_DETAILS[reason].format(countries=", ".join(unknown_designated))
+        state["missing_info_reasons"] = state.get("missing_info_reasons", []) + [
+            detail
+        ]
+    state["node_outputs"].append({"designated_country_check": answer})
+    return state
+
+
+def designated_country_check_node(state):
+    """Compute node for the sensitive_charities tree (state: SIAPState).
+
+    Fail safe, never crash: this node's failures become material Missing
+    Information — an already-screened charity must surface, not error out.
+    """
     try:
-        names = ", ".join(c["name"] for c in get_designated_countries())
+        rows = get_designated_countries()
+        designated_codes = {r["code"].strip().upper() for r in rows}
+        designated_names = {r["name"].strip().lower() for r in rows}
     except Exception:
-        # A broken/missing designated-countries source must not take down every
-        # tree's prompts: only sensitive_charities consumes this token, and its
-        # compute node fails safe (material Missing Information) on its own.
-        names = ""
-    return {"designated_countries_list": names}
-
-
-class SIAPTree(ABC):
-
-    def __init__(self, info: dict, function_mapping: dict):
-        self.name = info["name"]
-        self.field = info["field"] if "field" in info else ""
-
-        # Category-specific compute handlers (e.g. sensitive_charities'
-        # designated_country_check) are registered in utils.function_mapping,
-        # not here — the engine stays category-agnostic.
-        function_mapping.update(
-            {
-                "scap_check": lambda s: self.scap_check_node(s),
-                "scap_check_charities": lambda s: self.scap_check_node(
-                    s, is_charity=True
-                ),
-            }
+        return _finish_designated_country_check(
+            state, "Missing Information", "designated_list_unavailable", []
         )
 
-        self.graph = self.load_graph_from_json(info, function_mapping).compile()
-
-    def load_graph_from_json(self, info: dict, function_mapping: dict):
-        graph = StateGraph(SIAPState)
-
-        graph.add_edge(START, info["start"])
-
-        result_nodes = {
-            "siap": self.siap,
-            "exit": self.exit_node,
-            "missing_information": self.missing_information,
-            "prohibited_relation": self.prohibited_relation,
-            "cooled_down_siap": self.cooled_down_siap,
-        }
-
-        for label, pointer in result_nodes.items():
-            graph.add_node(label, pointer)
-            graph.add_edge(label, END)
-
-        for label, node_info in info["nodes"].items():
-            pointer = None
-            transitions = node_info["transitions"]
-
-            if node_info["type"] == "prompt_chain":
-                graph.add_node(label, lambda state: state)
-                graph.add_edge(label, f"{label}_1")
-
-                for idx, prompt in enumerate(node_info["prompts"], start=1):
-                    is_last: bool = idx == len(node_info["prompts"])
-
-                    subnode_label = f"{label}_{idx}"
-                    pointer = self.prompt_node(
-                        subnode_label,
-                        prompt,
-                        output_format_mapping[node_info["output_format"]],
-                    )
-
-                    subnode_transitions = transitions.copy()
-                    if not is_last:
-                        for key in node_info["chain_key"]:
-                            subnode_transitions[key] = f"{label}_{idx+1}"
-
-                    graph.add_node(subnode_label, pointer)
-                    fetcher = result_fetcher
-                    if label == "verification" and is_last:
-                        fetcher = self.verification_result_fetcher
-                    graph.add_conditional_edges(
-                        subnode_label, fetcher, subnode_transitions
-                    )
-
-            else:
-                if node_info["type"] == "prompt":
-                    pointer = self.prompt_node(
-                        label,
-                        node_info["text"],
-                        output_format_mapping[node_info["output_format"]],
-                    )
-                else:
-                    pointer = function_mapping[label]
-
-                graph.add_node(label, pointer)
-                graph.add_conditional_edges(label, result_fetcher, transitions)
-
-        return graph
-
-    def verification_result_fetcher(self, state: SIAPState):
-        last = result_fetcher(state)
-        if last != "No":
-            return last
-
-        has_missing = any(
-            v == "Missing Information" and k.startswith("verification_")
-            for output in state["node_outputs"]
-            for k, v in output.items()
+    try:
+        llm = AzureChatOpenAI(**AZURE_OPENAI_LLM_CONFIG).with_structured_output(
+            CharityCountryExtraction
         )
-        return "Missing Information" if has_missing else "No"
-
-    def prompt_helper(
-        self, state: SIAPState, node_label: str, prompt: str, output_format: str
-    ) -> SIAPState:
-        formatted_question = prompt.format(
-            activity=f'"{state["client_activity"]}"',
-            **extra_placeholders(),
-        )
-        llm_result = llm_prompter_full(
-            state,
-            formatted_question,
-            output_format,
-        )
-
-        llm_answer = llm_result["answer"]
-        state["node_outputs"].append({node_label: llm_answer})
-        if llm_answer == "Missing Information":
-            reasoning = llm_result.get("reasoning")
-            if isinstance(reasoning, str) and reasoning.strip():
-                reason = reasoning.strip()
-            else:
-                reason = f"Insufficient information to answer: {formatted_question}"
-            state["missing_info_reasons"] = state.get("missing_info_reasons", []) + [
-                reason
-            ]
-
-        return state
-
-    def prompt_node(
-        self, node_label: str, prompt: str, output_format: str
-    ) -> Callable[[SIAPState], SIAPState]:
-        return lambda s: self.prompt_helper(s, node_label, prompt, output_format)
-
-    def exit_node(self, state: SIAPState) -> SIAPState:
-        state["result"] = "Not SIAP"
-        state.pop("missing_info_summary", None)
-        state.pop("missing_info_reasons", None)
-
-        return state
-
-    def missing_information(self, state: SIAPState) -> SIAPState:
-        state["result"] = "Missing Information"
-        reasons = state.get("missing_info_reasons", [])
-        unique_reasons = []
-        seen = set()
-        for reason in reasons:
-            if reason not in seen:
-                unique_reasons.append(reason)
-                seen.add(reason)
-
-        reasons_text = (
-            "; ".join(unique_reasons)
-            if unique_reasons
-            else "Client notes do not contain enough information to reach a determination."
-        )
-        prompt = "\n".join(
+        extraction: CharityCountryExtraction = llm.invoke(
             [
-                "Rewrite the following missing-information reasons into a single, concise justification (1-2 sentences).",
-                "Use professional KYC/AML analyst language.",
-                "Do not introduce assumptions.",
-                "Do not add facts not present in the reasons.",
-                "",
-                "Reasons:",
-                f"<<<\n{reasons_text}\n>>>",
+                HumanMessage(
+                    CHARITY_COUNTRY_EXTRACTION_PROMPT.format(
+                        client_notes=state["client_notes"],
+                        activity=state["client_activity"],
+                    )
+                )
             ]
         )
-        summary = llm_prompter(state, prompt, TextAnswer)
-        state["missing_info_summary"] = (
-            summary.strip()
-            if isinstance(summary, str) and summary.strip()
-            else reasons_text
+    except Exception:
+        return _finish_designated_country_check(
+            state, "Missing Information", "extraction_failed", []
         )
 
-        return state
+    # Guard: a 'determinable' claim with nothing extracted is not determinable.
+    if extraction.countries_determinable and not (
+        extraction.establishment_countries
+        or extraction.inflow_shares
+        or extraction.outflow_shares
+    ):
+        extraction.countries_determinable = False
 
-    def siap(self, state: SIAPState) -> SIAPState:
-        state["result"] = "SIAP"
-        state.pop("missing_info_summary", None)
-        state.pop("missing_info_reasons", None)
+    # Guard: shares strictly between 0 and 1 are almost certainly fractions
+    # (0.4 emitted for 40%). Trusting them would silently under-flag (0.4 >= 25
+    # is False), so treat them as unstated — a designated country then surfaces
+    # as material MI instead of a wrong No.
+    for f in extraction.inflow_shares + extraction.outflow_shares:
+        if f.share_pct is not None and 0 < f.share_pct < 1:
+            f.share_pct = None
 
-        return state
+    def is_designated(ref: CountryRef) -> bool:
+        # ISO code is the primary key (immune to naming variants such as
+        # 'Syria' vs 'Syrian Arab Republic'); name match is the fallback
+        # when the extraction could not supply a code.
+        if ref.iso_alpha2 and ref.iso_alpha2.strip().upper() in designated_codes:
+            return True
+        return ref.country.strip().lower() in designated_names
 
-    def cooled_down_siap(self, state: SIAPState) -> SIAPState:
-        state["result"] = "Cooled Down SIAP"
-        state.pop("missing_info_summary", None)
-        state.pop("missing_info_reasons", None)
-
-        return state
-
-    def prohibited_relation(self, state: SIAPState) -> SIAPState:
-        state["result"] = "Prohibited Relation"
-        state.pop("missing_info_summary", None)
-        state.pop("missing_info_reasons", None)
-
-        return state
-
-    def scap_check_node(self, state: SIAPState, is_charity: bool = False):
-        tag = "scap_check" if not is_charity else "scap_check_charity"
-
-        resulting_state = SCAPGraph(true_if_charity=is_charity).invoke(
-            state["client_notes"], state["client_activity"]
+    if any(is_designated(c) for c in extraction.establishment_countries):
+        return _finish_designated_country_check(
+            state, "Yes", "established_in_designated_country", []
         )
-        mapping = {
-            "SCAP": "Yes",
-            "No SCAP": "No",
-            "Missing Information": "Missing Information",
+
+    for limb, flows in (
+        ("designated_country_inflows", extraction.inflow_shares),
+        ("designated_country_outflows", extraction.outflow_shares),
+    ):
+        if any(
+            f.share_pct is not None and f.share_pct >= 25
+            for f in flows
+            if is_designated(f)
+        ):
+            return _finish_designated_country_check(state, "Yes", limb, [])
+
+    if not extraction.countries_determinable:
+        return _finish_designated_country_check(
+            state, "Missing Information", "countries_not_determinable", []
+        )
+
+    # The designation look-up runs on every extracted country whether or not a
+    # share is stated; shares only decide Yes vs material-MI.
+    unknown_designated = sorted(
+        {
+            f.country
+            for f in extraction.inflow_shares + extraction.outflow_shares
+            if f.share_pct is None and is_designated(f)
         }
+    )
+    if unknown_designated:
+        # A designated country appears but its share is not stated: MATERIAL
+        # missing information — this one fact separates the case from SIAP.
+        return _finish_designated_country_check(
+            state,
+            "Missing Information",
+            "designated_share_not_stated",
+            unknown_designated,
+        )
 
-        resulting_state = get_scap2_flag(resulting_state)
+    # Countries are known and none is designated. Any missing shares here are
+    # NON-MATERIAL (they could not change the outcome): a No, not MI.
+    return _finish_designated_country_check(
+        state, "No", "no_designated_country_nexus", []
+    )
 
-        state["node_outputs"].append({tag: mapping[resulting_state["scap2_flag"][0]]})
 
-        return state
+# Register in the EXISTING function_mapping dict defined in this module:
+#
+#     function_mapping = {
+#         ...,
+#         "designated_country_check": designated_country_check_node,
+#     }
